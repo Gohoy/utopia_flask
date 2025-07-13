@@ -106,10 +106,12 @@ def register_blueprints(app):
         from app.api.auth import bp as auth_bp
         from app.api.entries import bp as entries_bp
         from app.api.tags import bp as tags_bp
+        from app.api.ai_recognition import bp as ai_recognition_bp
 
         app.register_blueprint(auth_bp, url_prefix='/api/auth')
         app.register_blueprint(entries_bp, url_prefix='/api/entries')
         app.register_blueprint(tags_bp, url_prefix='/api/tags')
+        app.register_blueprint(ai_recognition_bp, url_prefix='/api/ai')
         logger.info("All blueprints registered successfully")
     except Exception as e:
         logger.error(f"Blueprint registration failed: {e}")
@@ -184,6 +186,10 @@ def init_swagger(app):
                 {
                     "name": "Tags",
                     "description": "标签系统相关接口"
+                },
+                {
+                    "name": "AI Recognition",
+                    "description": "AI图像识别和自动标签相关接口"
                 },
                 {
                     "name": "System",
