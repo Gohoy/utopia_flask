@@ -6,10 +6,13 @@ from PIL import Image
 import requests
 import json
 from datetime import datetime
+import tempfile
+import os
 
 from app import neo4j_client
 from app.models.entry import Entry
 from app.services.tag_service import TagService
+from app.services.ai_recognition_engine import AIRecognitionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +21,14 @@ class AIRecognitionService:
     
     def __init__(self):
         self.enabled = True
+        # 初始化AI识别引擎
+        self.ai_engine = AIRecognitionEngine()
         # 这里可以配置多个AI服务，比如百度、阿里云、Google Vision等
         self.recognition_providers = {
+            'enhanced': {
+                'enabled': True,
+                'confidence_threshold': 0.6
+            },
             'openai': {
                 'enabled': True,
                 'confidence_threshold': 0.7
@@ -45,30 +54,66 @@ class AIRecognitionService:
         try:
             service = cls()
             
-            # 如果没有图片数据，尝试从路径读取
-            if image_data is None:
-                try:
-                    with open(image_path, 'rb') as f:
-                        image_data = f.read()
-                except Exception as e:
-                    logger.error(f"读取图片失败: {e}")
-                    return False, "读取图片失败", {}
+            # 检查AI引擎是否可用
+            if not service.ai_engine.is_models_loaded():
+                # 如果AI引擎不可用，使用原有的识别方法
+                return service._fallback_recognition(image_path, image_data)
             
-            # 验证图片格式
+            # 准备图片路径
+            temp_file = None
             try:
-                image = Image.open(io.BytesIO(image_data))
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-            except Exception as e:
-                logger.error(f"图片格式验证失败: {e}")
-                return False, "图片格式不支持", {}
+                # 如果有图片数据但没有路径，创建临时文件
+                if image_data is not None and (not image_path or not os.path.exists(image_path)):
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+                    temp_file.write(image_data)
+                    temp_file.close()
+                    image_path = temp_file.name
+                
+                # 如果没有图片数据，尝试从路径读取
+                if image_data is None:
+                    try:
+                        with open(image_path, 'rb') as f:
+                            image_data = f.read()
+                    except Exception as e:
+                        logger.error(f"读取图片失败: {e}")
+                        return False, "读取图片失败", {}
+                
+                # 验证图片格式
+                try:
+                    image = Image.open(io.BytesIO(image_data))
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+                except Exception as e:
+                    logger.error(f"图片格式验证失败: {e}")
+                    return False, "图片格式不支持", {}
+                
+                # 使用新的AI引擎进行综合分析
+                recognition_result = service.ai_engine.analyze_image_comprehensive(image_path)
+                
+                if not recognition_result.get('success', False):
+                    # 如果新引擎失败，尝试原有的识别方法
+                    return service._fallback_recognition(image_path, image_data)
+                
+                return True, "识别成功", recognition_result
+                
+            finally:
+                # 清理临时文件
+                if temp_file and os.path.exists(temp_file.name):
+                    os.unlink(temp_file.name)
             
-            # 调用识别服务
-            recognition_result = service._recognize_with_openai(image_data)
+        except Exception as e:
+            logger.error(f"图像识别异常: {e}")
+            return False, "图像识别服务异常", {}
+    
+    def _fallback_recognition(self, image_path: str, image_data: bytes) -> Tuple[bool, str, Dict]:
+        """备用识别方法"""
+        try:
+            # 调用原有的识别服务
+            recognition_result = self._recognize_with_openai(image_data)
             
             if not recognition_result:
                 # 尝试本地识别
-                recognition_result = service._recognize_with_local(image_data)
+                recognition_result = self._recognize_with_local(image_data)
             
             if not recognition_result:
                 return False, "图像识别失败", {}
@@ -76,8 +121,37 @@ class AIRecognitionService:
             return True, "识别成功", recognition_result
             
         except Exception as e:
-            logger.error(f"图像识别异常: {e}")
-            return False, "图像识别服务异常", {}
+            logger.error(f"备用识别失败: {e}")
+            return False, "备用识别失败", {}
+    
+    @classmethod
+    def _extract_keywords_from_description(cls, description: str) -> List[str]:
+        """从描述中提取关键词"""
+        try:
+            # 简单的关键词提取
+            keywords = []
+            
+            # 定义一些常见的关键词
+            common_keywords = [
+                'cat', 'dog', 'bird', 'flower', 'tree', 'car', 'house', 'person',
+                'animal', 'plant', 'building', 'water', 'sky', 'grass', 'food',
+                'beautiful', 'colorful', 'bright', 'dark', 'large', 'small',
+                '猫', '狗', '鸟', '花', '树', '车', '房子', '人', '动物', '植物',
+                '建筑', '水', '天空', '草', '食物', '美丽', '彩色', '明亮', '黑暗',
+                '大', '小', '红色', '蓝色', '绿色', '黄色', '白色', '黑色'
+            ]
+            
+            description_lower = description.lower()
+            
+            for keyword in common_keywords:
+                if keyword.lower() in description_lower:
+                    keywords.append(keyword)
+            
+            return keywords[:10]  # 最多返回10个关键词
+            
+        except Exception as e:
+            logger.error(f"关键词提取失败: {e}")
+            return []
     
     def _recognize_with_openai(self, image_data: bytes) -> Optional[Dict]:
         """使用OpenAI Vision API进行图像识别"""
@@ -207,18 +281,56 @@ class AIRecognitionService:
         try:
             suggested_tags = []
             
+            # 获取分析结果
+            analysis = recognition_result.get('analysis', recognition_result)
+            
+            # 从建议的标签直接添加
+            if 'suggested_tags' in analysis:
+                for tag_name in analysis['suggested_tags']:
+                    tag_id = cls._ensure_tag_exists(tag_name, 'ai_generated', user_id)
+                    if tag_id:
+                        suggested_tags.append(tag_id)
+            
             # 从识别的物体生成标签
-            if 'objects' in recognition_result:
-                for obj in recognition_result['objects']:
-                    if obj.get('confidence', 0) > 0.7:
-                        tag_name = obj['name']
-                        category = obj.get('category', 'general')
+            if 'objects' in analysis:
+                for obj in analysis['objects']:
+                    if obj.get('confidence', 0) > 0.5:  # 降低阈值以包含更多标签
+                        tag_name = obj.get('class', obj.get('name', ''))
+                        category = 'object'
                         
                         # 检查标签是否存在，不存在则创建
                         tag_id = cls._ensure_tag_exists(tag_name, category, user_id)
                         if tag_id:
                             suggested_tags.append(tag_id)
             
+            # 从实体生成标签
+            if 'entities' in analysis:
+                for entity in analysis['entities']:
+                    entity_name = entity.get('entity', '')
+                    if entity_name:
+                        category = entity.get('category', 'entity')
+                        tag_id = cls._ensure_tag_exists(entity_name, category, user_id)
+                        if tag_id:
+                            suggested_tags.append(tag_id)
+            
+            # 从颜色生成标签
+            if 'dominant_colors' in analysis:
+                for color in analysis['dominant_colors']:
+                    tag_id = cls._ensure_tag_exists(f"颜色_{color}", 'color', user_id)
+                    if tag_id:
+                        suggested_tags.append(tag_id)
+            
+            # 从描述中提取关键词作为标签
+            if 'description' in analysis:
+                description = analysis['description']
+                # 简单的关键词提取
+                keywords = cls._extract_keywords_from_description(description)
+                for keyword in keywords:
+                    tag_id = cls._ensure_tag_exists(keyword, 'description', user_id)
+                    if tag_id:
+                        suggested_tags.append(tag_id)
+            
+            # 兼容旧格式
             # 从颜色生成标签
             if 'colors' in recognition_result:
                 for color in recognition_result['colors']:

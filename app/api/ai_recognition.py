@@ -123,7 +123,7 @@ def recognize_image():
         )
         
     except Exception as e:
-        return error_response(f"识别失败: {str(e)}", 500)
+        return error_response(f"识别失败1: {str(e)}", 500)
 
 @bp.route('/auto-tag/<entry_id>', methods=['POST'])
 @jwt_required()
@@ -362,6 +362,181 @@ def get_recognition_providers():
 @bp.errorhandler(413)
 def too_large(e):
     return error_response("文件大小超过限制", 413)
+
+@bp.route('/comprehensive', methods=['POST'])
+@jwt_required()
+@limiter.limit("5 per minute")
+def comprehensive_recognition():
+    """
+    综合图像识别接口
+    ---
+    tags:
+      - AI Recognition
+    summary: 综合识别图片内容
+    description: 使用增强的AI模型进行全面的图像识别，包括物体检测、图像描述、实体识别等
+    security:
+      - JWT: []
+    consumes:
+      - multipart/form-data
+    parameters:
+      - name: image
+        in: formData
+        type: file
+        required: true
+        description: 要识别的图片文件
+    responses:
+      200:
+        description: 识别成功
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+              example: true
+            message:
+              type: string
+              example: "识别成功"
+            data:
+              type: object
+              properties:
+                analysis:
+                  type: object
+                  properties:
+                    objects:
+                      type: array
+                      items:
+                        type: object
+                    description:
+                      type: string
+                    entities:
+                      type: array
+                      items:
+                        type: object
+                    suggested_tags:
+                      type: array
+                      items:
+                        type: string
+                    dominant_colors:
+                      type: array
+                      items:
+                        type: string
+                    image_info:
+                      type: object
+      400:
+        description: 请求错误
+      401:
+        description: 未授权
+      429:
+        description: 请求过于频繁
+    """
+    try:
+        # 检查是否有上传的文件
+        if 'image' not in request.files:
+            return error_response('请上传图片文件', 400)
+        
+        file = request.files['image']
+        
+        if file.filename == '':
+            return error_response('请选择图片文件', 400)
+        
+        if not allowed_file(file.filename):
+            return error_response('不支持的文件格式', 400)
+        
+        # 读取图片数据
+        image_data = file.read()
+        
+        # 调用AI识别服务
+        success, message, recognition_result = AIRecognitionService.recognize_image(
+            image_path=None,
+            image_data=image_data
+        )
+        
+        if not success:
+            return error_response(message, 400)
+        
+        # 获取当前用户ID
+        current_user_id = get_jwt_identity()
+        
+        # 生成标签建议
+        tag_success, tag_message, suggested_tag_ids = AIRecognitionService.generate_tags_from_recognition(
+            recognition_result, current_user_id
+        )
+        
+        # 添加标签信息到结果中
+        if tag_success:
+            recognition_result['suggested_tag_ids'] = suggested_tag_ids
+        
+        return success_response(
+            "综合识别成功",
+            {
+                "recognition_result": recognition_result,
+                "tag_suggestions": {
+                    "success": tag_success,
+                    "message": tag_message,
+                    "tag_ids": suggested_tag_ids if tag_success else []
+                }
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"综合识别失败: {e}")
+        return error_response("综合识别失败", 500)
+
+@bp.route('/model-status', methods=['GET'])
+@jwt_required()
+@limiter.limit("10 per minute")
+def get_model_status():
+    """
+    获取AI模型状态
+    ---
+    tags:
+      - AI Recognition
+    summary: 获取AI模型加载状态
+    description: 查看AI识别模型的当前状态
+    security:
+      - JWT: []
+    responses:
+      200:
+        description: 获取成功
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+              example: true
+            message:
+              type: string
+              example: "获取成功"
+            data:
+              type: object
+              properties:
+                models_loaded:
+                  type: boolean
+                yolo_loaded:
+                  type: boolean
+                blip_loaded:
+                  type: boolean
+                knowledge_base_size:
+                  type: integer
+    """
+    try:
+        service = AIRecognitionService()
+        
+        if hasattr(service, 'ai_engine'):
+            model_status = service.ai_engine.get_model_status()
+        else:
+            model_status = {
+                "models_loaded": False,
+                "yolo_loaded": False,
+                "blip_loaded": False,
+                "knowledge_base_size": 0
+            }
+        
+        return success_response("获取模型状态成功", model_status)
+        
+    except Exception as e:
+        logger.error(f"获取模型状态失败: {e}")
+        return error_response("获取模型状态失败", 500)
 
 @bp.errorhandler(429)
 def ratelimit_handler(e):
